@@ -1,0 +1,17 @@
+basicsr
+decord
+Flask
+Flask-Cors
+matplotlib
+numpy
+opencv-python
+opencv-contrib-python
+pandas
+pillow
+PyYAML
+requests
+scikit-image
+scikit-learn
+torch
+torchvision
+tqdm

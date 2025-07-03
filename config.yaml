@@ -1,0 +1,14 @@
+gpu_id: 0 # Set a non-existent GPU ID to use CPU
+ffmpeg: "/home/zlp/wyc/FFmpeg-Residual/ffmpeg" # "/home/yosame/Desktop/Grad_Proj/FFmpeg-Residual/ffmpeg"
+ffmpeg_residual: "/home/zlp/wyc/FFmpeg-Residual/ffmpeg" # modified FFmpeg that supports residual exporting
+
+source_server: "http://localhost:23333"
+
+video_width: 180
+video_height: 320
+
+classify_sample_rate: 10 # Use 1 frame in every x frames for GRU in classifier
+classify_model_path: "models/classifier.pth"
+
+sr_models: ["BasicVSR_3000_0.9426.pth"]
+vsr_models: [True]
