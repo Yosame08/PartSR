@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 import decord
 
-from .classifier import VideoClassifier
+from classifier.classifier import VideoClassifier
 from config import config
 
 from config import device_name

@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from torchvision.transforms import v2
 from torchvision.transforms.v2 import functional as F
 from PIL import Image
-from detector import RoIRPN
+from extractor.detector import RoIRPN
 
 import sys
 
