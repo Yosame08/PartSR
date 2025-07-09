@@ -8,7 +8,6 @@ from collections import OrderedDict
 import os
 import tqdm
 import torch
-import torch.nn.functional as F
 import time
 import numpy as np
 import logging
@@ -16,10 +15,11 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-do_batch = True
 from config import device_name, config, vsr_models
 device = torch.device(device_name)
 dnn_pth_list = config["sr_models"]
+pad = config["pad"]
+batch_size = config["batch_size"]
 prefixes = ["super_resolution/models/", "models/"]
 
 # 并行的超分辨率处理函数
@@ -30,10 +30,10 @@ def mp_server_sr(sr_queue, pipe_conn, result_dict, queue_lock, dnn_queue_counts)
     pipe_conn.send(inferrer.run_benchmark())
     pipe_conn.close()  # 关闭管道连接
     while True:
-        identifier, tensors, roi_list, action = sr_queue.get()
+        identifier, tensors, SR_size, action = sr_queue.get()
         if tensors is None:
             break
-        result = inferrer.super_resolution(tensors, roi_list, action=action, replacement=False)
+        result = inferrer.super_resolution(tensors, SR_size, action=action)
         result_dict[identifier] = result
         with queue_lock:
             dnn_queue_counts[action] -= 1
@@ -41,10 +41,10 @@ def mp_server_sr(sr_queue, pipe_conn, result_dict, queue_lock, dnn_queue_counts)
 def mp_client_sr(sr_queue, result_dict):
     inferrer = Inferrer(dnn_pth_list)
     while True:
-        identifier, tensors, roi_list, action = sr_queue.get()
+        identifier, tensors, SR_size, action = sr_queue.get()
         if tensors is None:
             break
-        result = inferrer.super_resolution(tensors, roi_list, action=action, replacement=False)
+        result = inferrer.super_resolution(tensors, SR_size, action=action)
         result_dict[identifier] = result
 
 def measure_time(model: torch.nn.Module, w, h, vsr_model, warmup=3):
@@ -75,10 +75,11 @@ def measure_time(model: torch.nn.Module, w, h, vsr_model, warmup=3):
     return (tot_time - max_time - min_time) / (test_time - 2)
 
 def load_basicsr_model(checkpoint):
-    if "state_dict" in checkpoint:
-        state_dict = checkpoint["state_dict"]
-    elif "params" in checkpoint:  # BasicSR 保存的权重文件
-        state_dict = checkpoint["params"]
+    preference = ["params", "params_ema"]
+    if preference[0] in checkpoint:  # BasicSR 保存的权重文件
+        state_dict = checkpoint[preference[0]]
+    elif preference[1] in checkpoint:
+        state_dict = checkpoint[preference[1]]
     else:
         state_dict = checkpoint
 
@@ -89,6 +90,44 @@ def load_basicsr_model(checkpoint):
         else:
             new_state_dict[k] = v
     return new_state_dict
+
+def generate_sr_patch(tensors: torch.Tensor, roi_list: np.ndarray) -> torch.Tensor:
+    """
+    CPU生成用于超分的图像批次
+
+    Args:
+        tensors: 输入图像批次 (B, C, H, W)
+        roi_list: 每张图像的ROI坐标 [(x1, y1, x2, y2), ...]
+        pad: 为避免边缘效应扩展的像素数量
+
+    Returns:
+        (B, C, H + pad * 2, W + pad * 2)
+    """
+    B, C, H, W = tensors.shape
+    SR_size = roi_list[0][2] - roi_list[0][0]  # 计算 ROI 的宽度
+    pad_size = SR_size + pad * 2
+
+    # 阶段2: 裁剪 ROI 区域
+    lr_patches = []
+    for batch_idx in range(B):
+        x1, y1, x2, y2 = roi_list[batch_idx]
+
+        x1_exp = max(0, x1 - pad)
+        y1_exp = max(0, y1 - pad)
+        x2_exp = min(W, x2 + pad)
+        y2_exp = min(H, y2 + pad)
+        patch = tensors[batch_idx, :, y1_exp:y2_exp, x1_exp:x2_exp]  # (C, H, W)
+        pad_left = pad - (x1 - x1_exp)
+        pad_right = pad - (x2_exp - x2)
+        pad_top = pad - (y1 - y1_exp)
+        pad_bottom = pad - (y2_exp - y2)
+        padded = torch.nn.functional.pad(patch, (pad_left, pad_right, pad_top, pad_bottom), mode='reflect')
+
+        lr_patches.append(padded)
+        assert (padded.shape[-2], padded.shape[-1]) == (pad_size, pad_size), f"SR input shape error: {(x1, y1, x2, y2)}, shape: {padded.shape}, pad={pad}"
+
+    # 阶段3: 批量超分推理
+    return torch.stack(lr_patches, dim=0)
 
 class Inferrer:
     def __init__(self, model_names: List[str]):
@@ -103,7 +142,9 @@ class Inferrer:
                     break
             name = name.lower()
             if name.startswith("edsr"):
-                if 'm' in name[4:]:
+                if 's' in name[4:]:
+                    model = EDSR(3, 3, 32, 8)
+                elif 'm' in name[4:]:
                     model = EDSR(3, 3, 64, 16)
                 elif 'l' in name[4:]:
                     model = EDSR(3, 3, 256, 32, res_scale=0.1)
@@ -171,108 +212,34 @@ class Inferrer:
             ret.append(float(slope))
         return ret
     
-    def super_resolution(self, tensors: torch.Tensor, roi_list: np.ndarray, action: int, replacement: bool=False, pad: int=5) -> torch.Tensor:
+    def super_resolution(self, tensors: torch.Tensor, SR_size: int, action: int, scale_factor: int=4) -> torch.Tensor:
         """
-        逐样本处理不同尺寸ROI的优化版本
-
         Args:
-            tensors: 输入图像批次 (B, C, H, W)
-            roi_list: 每张图像的ROI坐标 [(x1, y1, x2, y2), ...]
-            action: 选择进行超分辨率处理的模型
-            replacement: 是否将原图像上采样后替换对应区域
+            tensors: input patches (B, C, H, W)
+            SR_size: original patch size (without padding)
+            action: choice of SR model
 
         Returns:
-            融合后的高分辨率图像 (B, C, H*4, W*4)
+            HR patches (B, C, H*4, W*4)
         """
-        B, C, H, W = tensors.shape
-        scale_factor = 4
-        SR_size = roi_list[0][2] - roi_list[0][0]  # 计算 ROI 的宽度
-        pad_size = SR_size + pad * 2
-
-        # 阶段2: 裁剪 ROI 区域
-        lr_patches = []
-        positions = []
-        for batch_idx in range(B):
-            x1, y1, x2, y2 = roi_list[batch_idx]
-            
-            x1_exp = max(0, x1 - pad) 
-            y1_exp = max(0, y1 - pad)  
-            x2_exp = min(W, x2 + pad)
-            y2_exp = min(H, y2 + pad)
-            patch = tensors[batch_idx, :, y1_exp:y2_exp, x1_exp:x2_exp]  # (C, H, W)
-            pad_left = pad - (x1 - x1_exp)
-            pad_right = pad - (x2_exp - x2)
-            pad_top = pad - (y1 - y1_exp)
-            pad_bottom = pad - (y2_exp - y2)
-            padded_patch = torch.nn.functional.pad(patch, (pad_left, pad_right, pad_top, pad_bottom), mode='replicate')
-            
-            # lr_patch = tensors[batch_idx, :, y1:y2, x1:x2].unsqueeze(0)  # (1, C, h, w)
-            lr_patch = padded_patch.unsqueeze(0)
-            lr_patches.append(lr_patch)
-            positions.append((x1, y1, x2, y2))
-            if lr_patch.shape[-2:] != (pad_size, pad_size):
-                print("SR input shape error:", x1, y1, x2, y2, lr_patch.shape, pad)
-
-        # 阶段3: 批量超分推理
-        lr_patches = torch.cat(lr_patches, dim=0).to(device)
-        
-        with torch.no_grad():
-            if (not vsr_models[action]) and do_batch:
-                assert B % 4 == 0, f"Batch size {B} is not divisible by 4"
-                batch_size = B // 4  # (B, C, H*4, W*4)
-                sr_patches = []
-                for i in range(0, B, batch_size):
-                    batch_lr_patches = lr_patches[i:i + batch_size]
-                    sr_batch_patches = self.models[action](batch_lr_patches)
-                    # print(batch_lr_patches[0, 0, 0, 0:10])
-                    # print(sr_batch_patches[0, 0, 0, 0:10])
-                    sr_patches.append(sr_batch_patches)
-                sr_patches = torch.cat(sr_patches, dim=0)
-                # print(sr_patches[0][0][0])
-            else:
-                if vsr_models[action]:
-                    lr_patches = lr_patches.unsqueeze(0)
-                sr_patches = self.models[action](lr_patches) 
-            # print(sr_patches.shape)
-            
-        if vsr_models[action]:
-            sr_patches = sr_patches.squeeze(0)
-            
-        assert sr_patches.shape[2] == pad_size * scale_factor and sr_patches.shape[3] == pad_size * scale_factor
-        
+        b = batch_size[action]
         pos_low = pad * scale_factor
         pos_high = (pad + SR_size) * scale_factor
-        sr_patches = sr_patches[:, :, pos_low:pos_high, pos_low:pos_high]  # (B, C, H*4, W*4)
+        res = []
+        with torch.no_grad():
+            if vsr_models[action]:
+                for i in range(0, tensors.size(0), b):
+                    batch = tensors[i:i + b]
+                    sr_part = self.models[action](batch.unsqueeze(0).to(device))
+                    res.append(sr_part[0, :, :, pos_low:pos_high, pos_low:pos_high])
+            else:
+                for i in range(0, tensors.size(0), b):
+                    batch = tensors[i:i + b]
+                    sr_part = self.models[action](batch.to(device))
+                    res.append(sr_part[:, :, pos_low:pos_high, pos_low:pos_high])
+
+        sr_patches = torch.cat(res, dim=0)  # (B, C, H*4, W*4)
         print(sr_patches.shape)
-            
-        if not replacement:
-            # 如果不替换，直接返回超分结果
-            return sr_patches.cpu()
 
-        # 阶段4: 替换到基础图像
-        if replacement:
-            with torch.no_grad():
-                hr_base = F.interpolate(tensors.to(device), scale_factor=scale_factor,
-                                        mode='bicubic', align_corners=False)
-        
-        for idx, (x1, y1, x2, y2) in enumerate(positions):
-            hr_x1 = x1 * scale_factor
-            hr_y1 = y1 * scale_factor
-            hr_x2 = x2 * scale_factor
-            hr_y2 = y2 * scale_factor
-
-            # 尺寸对齐检查与调整
-            target_h = hr_y2 - hr_y1
-            target_w = hr_x2 - hr_x1
-            sr_patch = sr_patches[idx:idx + 1]  # 取出当前的超分结果
-            if sr_patch.shape[-2:] != (target_h, target_w):
-                sr_patch = F.interpolate(sr_patch,
-                                        size=(target_h, target_w),
-                                        mode='bicubic',
-                                        align_corners=False)
-
-            # 替换到基础图像
-            hr_base[idx, :, hr_y1:hr_y2, hr_x1:hr_x2] = sr_patch.squeeze(0)
-
-        return hr_base.cpu()
+        return sr_patches.cpu()
 

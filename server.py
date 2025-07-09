@@ -16,7 +16,7 @@ from classifier.classifier import Classifier
 from extractor.extractor import RoIExtractor
 from extractor.detector import Detector
 from scheduler.scheduler import Scheduler
-from super_resolution.infer import dnn_pth_list, mp_server_sr
+from super_resolution.infer import dnn_pth_list, mp_server_sr, generate_sr_patch
 from utils.mp4_bin_editor import update_reencode_metadata
 from utils.utils import decode_mv_residual, ffmpeg_tensor_to_bytes, roi_center_to_xyxy
 
@@ -81,18 +81,17 @@ def part_sr(identifier: str, video: bytes) -> bytes:
     # action = scheduler.infer(ndarray.shape[2:], user, q, dnn_latency_param)
     action = 0
     SR_size = min(ndarray.shape[1], ndarray.shape[2]) // 2
-    # print("roi_array", roi_array)
     roi_xyxy = roi_center_to_xyxy(roi_array, SR_size, (ndarray.shape[1], ndarray.shape[2]))
-    # print(f"roi_xyxy: {roi_xyxy}")
     time.sleep(random.uniform(0.03, 0.1))  # 模拟调度延迟
     schedule_time = time.perf_counter() - bg
     print(f"time = {schedule_time:.3f}s, action: {action}, SR_size: {SR_size}")
 
     if action < dnn_number:  # 5. 如果是在服务器超分
         bg = print("(5)[super resolution]", end=" ") or time.perf_counter()
+        tensor_for_SR = generate_sr_patch(tensors_div_255, roi_xyxy)
         with queue_lock:
             dnn_queue_counts[action] += 1
-        app.config['sr_queue'].put((identifier, tensors_div_255, roi_xyxy, action))
+        app.config['sr_queue'].put((identifier, tensor_for_SR, SR_size, action))
         while identifier not in result_dict:
             time.sleep(0.01)  # Wait for the SR process to finish
         tensor = result_dict.pop(identifier)
