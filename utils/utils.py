@@ -18,25 +18,25 @@ def del_if_exist(filename: str):
     except FileNotFoundError:
         pass
 
-def roi_center_to_xyxy(roi_center: List[Tuple[int, int]], size: int, frame_shape: Tuple[int, int]) -> np.ndarray:
+def roi_center_to_xyxy(roi_center: List[Tuple[int, int]], SR_size: int, frame_shape: Tuple[int, int]) -> np.ndarray:
     """
     :param roi_center: [(x, y), (x, y), ...]
-    :param size: size for SR
+    :param SR_size: size for SR
     :param frame_shape: (H, W)
     """
-    assert frame_shape[0] >= size and frame_shape[1] >= size, "Frame size must be larger than ROI size"
+    assert frame_shape[0] >= SR_size and frame_shape[1] >= SR_size, "Frame size must be larger than ROI size"
     xyxy = []
-    half_size = size // 2
+    half_size = SR_size // 2
     for idx in range(len(roi_center)):
         x_center, y_center = roi_center[idx]
         def check_bound(center: int, lim: int) -> Tuple[int, int]:
             val1 = center - half_size if center >= half_size else 0
-            if val1 + size > lim:
-                dif = val1 + size - lim
+            if val1 + SR_size > lim:
+                dif = val1 + SR_size - lim
                 val1 -= dif
                 val2 = lim
             else:
-                val2 = val1 + size
+                val2 = val1 + SR_size
             return val1, val2
         x1, x2 = check_bound(x_center, frame_shape[1])
         y1, y2 = check_bound(y_center, frame_shape[0])
@@ -76,7 +76,7 @@ def decode_residual(filename: str, frame_num: int) -> np.ndarray:
     return np.array(residual_list)
 
 def decode_mv_residual(video_bytes: bytes, identifier: str, limit: int=0)\
-        -> Tuple[np.ndarray, float, List[List], List[str], np.ndarray]:
+        -> Tuple[np.ndarray, float, List[List], List[str], np.ndarray]: # limit is only for debug
     tmp_name = f"/dev/shm/{identifier}.mp4"
     with open(tmp_name, "wb") as f:
         f.write(video_bytes)
